@@ -1,9 +1,11 @@
 
+import csv
 import re
 from pathlib import Path
 
 from openpyxl import load_workbook
 
+from app.config import BATCH_SIZE
 from app.database import save_records_in_batches
 
 
@@ -238,45 +240,73 @@ def import_excel_to_firestore(
     file_path,
     job_id,
     before_commit=None,
+    error_report_path=None,
 ):
     """
     Validate Excel rows and save valid records
     to Firestore in batches.
 
-    Invalid rows are collected for the
-    Day 4 CSV error-report functionality.
+    Invalid rows are streamed to a CSV at
+    error_report_path (created only if a row is
+    invalid), so memory does not grow with the
+    number of bad rows.
     """
 
-    invalid_rows = []
+    if error_report_path is None:
+        error_report_path = Path(file_path).with_name(
+            "errors.csv"
+        )
+
+    error_report_path = Path(error_report_path)
     valid_count = 0
+    invalid_count = 0
+    report_file = None
+    report_writer = None
 
     def valid_records():
-        nonlocal valid_count
+        nonlocal valid_count, invalid_count
+        nonlocal report_file, report_writer
 
         for row_number, record, error in process_excel(
             file_path
         ):
             if error:
-                invalid_rows.append({
-                    "row_number": row_number,
-                    "error": error,
-                })
+                if report_writer is None:
+                    report_file = open(
+                        error_report_path,
+                        "w",
+                        newline="",
+                        encoding="utf-8",
+                    )
+                    report_writer = csv.writer(report_file)
+                    report_writer.writerow(
+                        ["row_number", "error"]
+                    )
+
+                report_writer.writerow([row_number, error])
+                invalid_count += 1
             else:
                 valid_count += 1
 
                 yield row_number, record
 
-    saved_count = save_records_in_batches(
-        job_id=job_id,
-        records=valid_records(),
-        batch_size=200,
-        before_commit=before_commit,
-    )
+    try:
+        saved_count = save_records_in_batches(
+            job_id=job_id,
+            records=valid_records(),
+            batch_size=BATCH_SIZE,
+            before_commit=before_commit,
+        )
+    finally:
+        if report_file:
+            report_file.close()
 
     return {
         "job_id": job_id,
         "valid_rows": valid_count,
-        "invalid_rows": len(invalid_rows),
+        "invalid_rows": invalid_count,
         "saved_records": saved_count,
-        "errors": invalid_rows,
+        "error_report_path": (
+            error_report_path if invalid_count else None
+        ),
     }

@@ -1,5 +1,6 @@
-fastapi
-uvicorn
-google-cloud-storage
-google-cloud-firestore
-openpyxl
+fastapi==0.162.0
+uvicorn==0.54.0
+pydantic==2.14.3
+google-cloud-storage==3.17.1
+google-cloud-firestore==2.34.1
+openpyxl==3.1.5

@@ -4,12 +4,18 @@ import json
 import logging
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from google.cloud import storage
 
+from app.config import (
+    LEASE_RENEW_SECONDS,
+    MAX_CONCURRENT_JOBS,
+)
 from app.job_manager import (
     claim_job,
     finish_job,
@@ -17,7 +23,7 @@ from app.job_manager import (
     renew_job_lease,
 )
 from app.processor import import_excel_to_firestore
-from app.error_report import generate_error_csv, upload_error_report
+from app.error_report import upload_error_report
 
 
 # --------------------------------------------------
@@ -35,6 +41,8 @@ BUCKET_NAME = os.getenv(
     "BUCKET_NAME",
     "bulk-excel-processor",
 )
+
+job_slots = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
 
 
 # --------------------------------------------------
@@ -96,6 +104,26 @@ def handle_pubsub_push(envelope: PubSubEnvelope):
             detail="Invalid Pub/Sub message",
         ) from exc
 
+    # A non-2xx response makes Pub/Sub redeliver with backoff,
+    # so an overloaded instance never queues work in memory.
+    if not job_slots.acquire(blocking=False):
+        logger.info(
+            "All %d job slots busy; deferring job %s",
+            MAX_CONCURRENT_JOBS,
+            job_id,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Worker at capacity; retry later",
+        )
+
+    try:
+        return _process_job(job_id)
+    finally:
+        job_slots.release()
+
+
+def _process_job(job_id):
     # Step 2: Claim processing ownership.
     try:
         claim = claim_job(job_id)
@@ -112,11 +140,13 @@ def handle_pubsub_push(envelope: PubSubEnvelope):
     if not claim["claimed"]:
         reason = claim["reason"]
 
-        # Terminal jobs do not need another retry.
+        # Terminal or nonexistent jobs do not need another
+        # retry; acknowledging stops endless redelivery.
         if reason in (
             "completed",
             "failed",
             "max_attempts",
+            "not_found",
         ):
             return {
                 "status": "already_finished",
@@ -135,7 +165,17 @@ def handle_pubsub_push(envelope: PubSubEnvelope):
     job = claim["job"]
 
     # Step 3: Define lease verification callback.
-    def verify_and_renew():
+    # During batch writes, renew at most every
+    # LEASE_RENEW_SECONDS instead of on every batch.
+    last_renewed = time.monotonic()
+
+    def verify_and_renew(force=False):
+        nonlocal last_renewed
+        now = time.monotonic()
+
+        if not force and now - last_renewed < LEASE_RENEW_SECONDS:
+            return
+
         renewed = renew_job_lease(
             job_id=job_id,
             attempt_id=attempt_id,
@@ -145,6 +185,8 @@ def handle_pubsub_push(envelope: PubSubEnvelope):
             raise RuntimeError(
                 "Processing lease lost or expired"
             )
+
+        last_renewed = time.monotonic()
 
     # Step 4: Download and process Excel.
     try:
@@ -173,31 +215,28 @@ def handle_pubsub_push(envelope: PubSubEnvelope):
             )
 
             # Verify ownership after downloading.
-            verify_and_renew()
+            verify_and_renew(force=True)
 
             result = import_excel_to_firestore(
                 file_path=local_path,
                 job_id=job_id,
                 before_commit=verify_and_renew,
+                error_report_path=Path(temp_dir) / "errors.csv",
             )
 
-            # Generate and upload the error report if needed.
+            # Upload the error report written during processing.
             error_report_object_name = None
+            csv_path = result.pop("error_report_path")
 
-            if result["invalid_rows"] > 0:
-                verify_and_renew()
-
-                csv_path = generate_error_csv(
-                    errors=result["errors"],
-                    output_path=Path(temp_dir) / "errors.csv",
-                )
+            if csv_path:
+                verify_and_renew(force=True)
 
                 error_report_object_name = upload_error_report(
                     job_id=job_id,
                     csv_path=csv_path,
                 )
 
-                verify_and_renew()
+                verify_and_renew(force=True)
 
             result["error_report_object_name"] = (
                 error_report_object_name

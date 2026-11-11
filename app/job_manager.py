@@ -1,13 +1,11 @@
 \
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from google.cloud import firestore
+from app.config import LEASE_DURATION, MAX_ATTEMPTS
 from app.database import db
 
-
-LEASE_DURATION = timedelta(minutes=10)
-MAX_ATTEMPTS = 3
 
 COMPLETED_STATUSES = (
     "Completed",

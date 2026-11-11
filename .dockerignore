@@ -1,0 +1,9 @@
+venv/
+.venv/
+.env
+.git/
+__pycache__/
+benchmarks/
+test_*.py
+*.xlsx
+*.md
